@@ -1,0 +1,10 @@
+kp 0
+ki 0
+kd 0
+kp_lin .1
+ki_lin 0
+kd_lin 0
+kp_turn 1
+ki_turn 0
+kd_turn .3
+lookAheadDis 0.6
