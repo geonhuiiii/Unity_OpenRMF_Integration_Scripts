@@ -28,6 +28,10 @@ public class BuildingYamlGenerator : EditorWindow
     float namedPointConnectionRadius = 3.0f;
     string outputPath = "";
     Vector2 scrollPos;
+    bool showLaneVisualization = false;
+
+    List<OrientedLane> cachedOrientedLanes;
+    List<float[]> cachedVertices;
 
     [MenuItem("OpenRMF/Generate Building YAML")]
     static void ShowWindow()
@@ -40,6 +44,12 @@ public class BuildingYamlGenerator : EditorWindow
     {
         if (string.IsNullOrEmpty(outputPath))
             outputPath = Path.Combine(Application.dataPath, "..", "building.yaml");
+        SceneView.duringSceneGui += OnSceneGUI;
+    }
+
+    void OnDisable()
+    {
+        SceneView.duringSceneGui -= OnSceneGUI;
     }
 
     void OnGUI()
@@ -58,6 +68,7 @@ public class BuildingYamlGenerator : EditorWindow
         gridResolution = EditorGUILayout.Slider("그리드 간격 (m)", gridResolution, 0.5f, 5.0f);
         wallPadding = EditorGUILayout.Slider("벽 패딩 (m)", wallPadding, 0.1f, 2.0f);
         bidirectionalLanes = EditorGUILayout.Toggle("양방향 레인", bidirectionalLanes);
+        showLaneVisualization = EditorGUILayout.Toggle("레인 시각화", showLaneVisualization);
         namedPointConnectionRadius = EditorGUILayout.Slider("포인트 연결 반경 (m)", namedPointConnectionRadius, 1.0f, 10.0f);
 
         EditorGUILayout.Space();
@@ -132,6 +143,13 @@ public class BuildingYamlGenerator : EditorWindow
     {
         public Vector2 p1, p2;
         public string name;
+    }
+
+    struct OrientedLane
+    {
+        public int from;
+        public int to;
+        public bool isBidirectional;
     }
 
     // ─── Main generation ───
@@ -317,18 +335,45 @@ public class BuildingYamlGenerator : EditorWindow
             }
         }
 
-        // 8) YAML 출력
+        // 8) 레인 방향 처리
+        List<OrientedLane> orientedLanes;
+        if (bidirectionalLanes)
+        {
+            orientedLanes = laneSegments
+                .Select(l => new OrientedLane { from = l[0], to = l[1], isBidirectional = true })
+                .ToList();
+        }
+        else
+        {
+            orientedLanes = ApplySmartUnidirectional(laneSegments);
+        }
+
+        cachedOrientedLanes = orientedLanes;
+        cachedVertices = new List<float[]>(vertices);
+        SceneView.RepaintAll();
+
+        // 9) YAML 출력
         float xMeters = floorBounds.width;
         float yMeters = floorBounds.height;
 
         string yaml = BuildYaml(vertices, vertexNames, vertexParams,
-            wallSegments, laneSegments, doorEntries, floorVertexIndices,
+            wallSegments, orientedLanes, doorEntries, floorVertexIndices,
             doors, xMeters, yMeters);
+
+        int uniCount = orientedLanes.Count(l => !l.isBidirectional);
+        int biCount = orientedLanes.Count(l => l.isBidirectional);
 
         File.WriteAllText(outputPath, yaml, new UTF8Encoding(false));
         Debug.Log($"[BuildingYAML] 생성 완료: {outputPath}\n" +
                   $"  vertices: {vertices.Count}, walls: {wallSegments.Count}, " +
-                  $"lanes: {laneSegments.Count}, named: {namedPoints.Count}");
+                  $"  lanes: {orientedLanes.Count} (단방향: {uniCount}, 양방향: {biCount}), named: {namedPoints.Count}");
+        if (!bidirectionalLanes)
+        {
+            bool stronglyConnected = VerifyStrongConnectivity(orientedLanes);
+            Debug.Log($"[BuildingYAML] 강연결 검증: {(stronglyConnected ? "PASS" : "FAIL")}");
+            if (!stronglyConnected)
+                Debug.LogWarning("[BuildingYAML] 경고: 생성된 단방향 그래프가 강연결이 아닙니다. 일부 경로가 도달 불가능할 수 있습니다.");
+        }
         EditorUtility.RevealInFinder(outputPath);
     }
 
@@ -605,11 +650,225 @@ public class BuildingYamlGenerator : EditorWindow
                pt.y <= Mathf.Max(segA.y, segB.y) + 1e-5f;
     }
 
+    // ─── Smart Unidirectional ───
+
+    List<OrientedLane> ApplySmartUnidirectional(List<int[]> laneSegments)
+    {
+        var adj = BuildAdjacencyList(laneSegments);
+        if (adj.Count == 0) return new List<OrientedLane>();
+
+        var bridges = FindBridges(adj);
+        var orientedLanes = OrientEdgesWithDFS(adj, bridges);
+
+        int bridgeCount = orientedLanes.Count(l => l.isBidirectional);
+        Debug.Log($"[BuildingYAML] 스마트 단방향: bridge {bridgeCount}개 → 양방향 유지");
+
+        return orientedLanes;
+    }
+
+    Dictionary<int, HashSet<int>> BuildAdjacencyList(List<int[]> laneSegments)
+    {
+        var adj = new Dictionary<int, HashSet<int>>();
+        foreach (var seg in laneSegments)
+        {
+            int u = seg[0], v = seg[1];
+            if (!adj.ContainsKey(u)) adj[u] = new HashSet<int>();
+            if (!adj.ContainsKey(v)) adj[v] = new HashSet<int>();
+            adj[u].Add(v);
+            adj[v].Add(u);
+        }
+        return adj;
+    }
+
+    HashSet<(int, int)> FindBridges(Dictionary<int, HashSet<int>> adj)
+    {
+        var bridges = new HashSet<(int, int)>();
+        var disc = new Dictionary<int, int>();
+        var low = new Dictionary<int, int>();
+        int timer = 0;
+
+        foreach (int startNode in adj.Keys)
+        {
+            if (disc.ContainsKey(startNode)) continue;
+
+            var stack = new Stack<(int u, int parent, IEnumerator<int> iter)>();
+            disc[startNode] = low[startNode] = timer++;
+            stack.Push((startNode, -1, adj[startNode].GetEnumerator()));
+
+            while (stack.Count > 0)
+            {
+                var top = stack.Peek();
+                int u = top.u;
+                int pu = top.parent;
+                var iter = top.iter;
+                bool pushed = false;
+
+                while (iter.MoveNext())
+                {
+                    int v = iter.Current;
+                    if (!disc.ContainsKey(v))
+                    {
+                        disc[v] = low[v] = timer++;
+                        stack.Push((v, u, adj[v].GetEnumerator()));
+                        pushed = true;
+                        break;
+                    }
+                    else if (v != pu)
+                    {
+                        low[u] = Mathf.Min(low[u], disc[v]);
+                    }
+                }
+
+                if (!pushed)
+                {
+                    stack.Pop();
+                    if (stack.Count > 0)
+                    {
+                        int parentNode = stack.Peek().u;
+                        low[parentNode] = Mathf.Min(low[parentNode], low[u]);
+                        if (low[u] > disc[parentNode])
+                        {
+                            int a = Mathf.Min(parentNode, u);
+                            int b = Mathf.Max(parentNode, u);
+                            bridges.Add((a, b));
+                        }
+                    }
+                }
+            }
+        }
+
+        return bridges;
+    }
+
+    List<OrientedLane> OrientEdgesWithDFS(
+        Dictionary<int, HashSet<int>> adj,
+        HashSet<(int, int)> bridges)
+    {
+        var result = new List<OrientedLane>();
+        var visited = new HashSet<int>();
+        var edgeProcessed = new HashSet<(int, int)>();
+
+        int startNode = adj.OrderByDescending(kv => kv.Value.Count).First().Key;
+
+        foreach (int compStart in new[] { startNode }.Concat(adj.Keys))
+        {
+            if (visited.Contains(compStart)) continue;
+
+            var stack = new Stack<(int u, IEnumerator<int> iter)>();
+            visited.Add(compStart);
+            stack.Push((compStart, adj[compStart].GetEnumerator()));
+
+            while (stack.Count > 0)
+            {
+                var top = stack.Peek();
+                int u = top.u;
+                var iter = top.iter;
+                bool pushed = false;
+
+                while (iter.MoveNext())
+                {
+                    int v = iter.Current;
+                    int a = Mathf.Min(u, v), b = Mathf.Max(u, v);
+                    var edgeKey = (a, b);
+
+                    if (edgeProcessed.Contains(edgeKey)) continue;
+                    edgeProcessed.Add(edgeKey);
+
+                    if (bridges.Contains(edgeKey))
+                    {
+                        result.Add(new OrientedLane { from = u, to = v, isBidirectional = true });
+                        if (!visited.Contains(v))
+                        {
+                            visited.Add(v);
+                            stack.Push((v, adj[v].GetEnumerator()));
+                            pushed = true;
+                            break;
+                        }
+                    }
+                    else if (!visited.Contains(v))
+                    {
+                        result.Add(new OrientedLane { from = u, to = v, isBidirectional = false });
+                        visited.Add(v);
+                        stack.Push((v, adj[v].GetEnumerator()));
+                        pushed = true;
+                        break;
+                    }
+                    else
+                    {
+                        result.Add(new OrientedLane { from = u, to = v, isBidirectional = false });
+                    }
+                }
+
+                if (!pushed)
+                {
+                    stack.Pop();
+                }
+            }
+        }
+
+        return result;
+    }
+
+    bool VerifyStrongConnectivity(List<OrientedLane> lanes)
+    {
+        var forward = new Dictionary<int, List<int>>();
+        var reverse = new Dictionary<int, List<int>>();
+        var allNodes = new HashSet<int>();
+
+        foreach (var lane in lanes)
+        {
+            allNodes.Add(lane.from);
+            allNodes.Add(lane.to);
+
+            if (!forward.ContainsKey(lane.from)) forward[lane.from] = new List<int>();
+            forward[lane.from].Add(lane.to);
+            if (!reverse.ContainsKey(lane.to)) reverse[lane.to] = new List<int>();
+            reverse[lane.to].Add(lane.from);
+
+            if (lane.isBidirectional)
+            {
+                if (!forward.ContainsKey(lane.to)) forward[lane.to] = new List<int>();
+                forward[lane.to].Add(lane.from);
+                if (!reverse.ContainsKey(lane.from)) reverse[lane.from] = new List<int>();
+                reverse[lane.from].Add(lane.to);
+            }
+        }
+
+        if (allNodes.Count == 0) return true;
+
+        int start = allNodes.First();
+        var forwardReachable = BFSReach(start, forward);
+        if (forwardReachable.Count != allNodes.Count) return false;
+
+        var reverseReachable = BFSReach(start, reverse);
+        return reverseReachable.Count == allNodes.Count;
+    }
+
+    HashSet<int> BFSReach(int start, Dictionary<int, List<int>> adj)
+    {
+        var visited = new HashSet<int> { start };
+        var queue = new Queue<int>();
+        queue.Enqueue(start);
+        while (queue.Count > 0)
+        {
+            int u = queue.Dequeue();
+            if (adj.TryGetValue(u, out var neighbors))
+            {
+                foreach (int v in neighbors)
+                {
+                    if (visited.Add(v))
+                        queue.Enqueue(v);
+                }
+            }
+        }
+        return visited;
+    }
+
     // ─── YAML output ───
 
     string BuildYaml(
         List<float[]> vertices, List<string> vNames, List<Dictionary<string, string>> vParams,
-        List<int[]> wallSegs, List<int[]> laneSegs, List<int[]> doorSegs,
+        List<int[]> wallSegs, List<OrientedLane> laneSegs, List<int[]> doorSegs,
         List<int> floorVerts, List<DoorInfo> doorInfos,
         float xMeters, float yMeters)
     {
@@ -683,8 +942,8 @@ public class BuildingYamlGenerator : EditorWindow
         {
             foreach (var l in laneSegs)
             {
-                string bidir = bidirectionalLanes ? "true" : "false";
-                sb.AppendLine($"      - [{l[0]}, {l[1]}, {{bidirectional: [4, {bidir}], demo_mock_floor_name: [1, \"\"], demo_mock_lift_name: [1, \"\"], graph_idx: [2, 0], orientation: [1, \"\"], speed_limit: [3, 0]}}]");
+                string bidir = l.isBidirectional ? "true" : "false";
+                sb.AppendLine($"      - [{l.from}, {l.to}, {{bidirectional: [4, {bidir}], demo_mock_floor_name: [1, \"\"], demo_mock_lift_name: [1, \"\"], graph_idx: [2, 0], orientation: [1, \"\"], speed_limit: [3, 0]}}]");
             }
         }
 
@@ -748,6 +1007,52 @@ public class BuildingYamlGenerator : EditorWindow
     {
         if (v == (int)v) return v.ToString("F1");
         return v.ToString("G8");
+    }
+
+    // ─── Scene Visualization ───
+
+    void OnSceneGUI(SceneView sceneView)
+    {
+        if (!showLaneVisualization || cachedOrientedLanes == null || cachedVertices == null)
+            return;
+
+        var prevZTest = Handles.zTest;
+        Handles.zTest = UnityEngine.Rendering.CompareFunction.LessEqual;
+
+        foreach (var lane in cachedOrientedLanes)
+        {
+            if (lane.from >= cachedVertices.Count || lane.to >= cachedVertices.Count) continue;
+
+            Vector3 from = new Vector3(cachedVertices[lane.from][0], 0.1f, cachedVertices[lane.from][1]);
+            Vector3 to = new Vector3(cachedVertices[lane.to][0], 0.1f, cachedVertices[lane.to][1]);
+
+            if (lane.isBidirectional)
+            {
+                Handles.color = new Color(0f, 0.85f, 0.2f, 0.7f);
+                Handles.DrawLine(from, to, 2f);
+            }
+            else
+            {
+                Handles.color = new Color(0.2f, 0.5f, 1f, 0.7f);
+                Handles.DrawLine(from, to, 1.5f);
+                DrawArrowHead(from, to, 0.3f);
+            }
+        }
+
+        Handles.zTest = prevZTest;
+    }
+
+    void DrawArrowHead(Vector3 from, Vector3 to, float size)
+    {
+        Vector3 dir = (to - from).normalized;
+        Vector3 mid = (from + to) * 0.5f;
+        Vector3 right = Vector3.Cross(Vector3.up, dir).normalized;
+
+        Vector3 tip = mid + dir * size;
+        Vector3 p1 = mid - dir * size * 0.3f + right * size * 0.5f;
+        Vector3 p2 = mid - dir * size * 0.3f - right * size * 0.5f;
+
+        Handles.DrawAAConvexPolygon(tip, p1, p2);
     }
 }
 #endif
